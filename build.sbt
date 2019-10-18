@@ -18,8 +18,12 @@ lazy val compile = Seq(
   "uk.gov.hmrc" %% "play-hmrc-api" % "3.6.0-play-25",
   "uk.gov.hmrc" %% "metrix" % "3.8.0-play-25",
   "com.typesafe.play" %% "play-iteratees" % PlayVersion.current,
-  "org.reactivemongo" %% "reactivemongo-iteratees" % "0.16.4"
+  "org.reactivemongo" %% "reactivemongo-iteratees" % "0.16.4",
+  "org.typelevel" %% "cats-core" % "2.0.0"
 )
+
+scalacOptions += "-Ypartial-unification"
+
 lazy val test = Seq(
   "uk.gov.hmrc" %% "reactivemongo-test" % "4.15.0-play-25" % "test,it",
   "uk.gov.hmrc" %% "hmrctest" % "3.9.0-play-25" % "test,it",

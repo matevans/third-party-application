@@ -20,6 +20,7 @@ import java.util.UUID
 import java.util.concurrent.TimeUnit
 
 import akka.actor.ActorSystem
+import cats.data.{EitherT, OptionT}
 import javax.inject.{Inject, Singleton}
 import org.joda.time.Duration.standardMinutes
 import play.api.Logger
@@ -35,7 +36,7 @@ import uk.gov.hmrc.thirdpartyapplication.models.RateLimitTier.RateLimitTier
 import uk.gov.hmrc.thirdpartyapplication.models.Role._
 import uk.gov.hmrc.thirdpartyapplication.models.State.{PENDING_GATEKEEPER_APPROVAL, PENDING_REQUESTER_VERIFICATION, State, TESTING}
 import uk.gov.hmrc.thirdpartyapplication.models.db.ApplicationData
-import uk.gov.hmrc.thirdpartyapplication.models.{ApplicationNameValidationResult, _}
+import uk.gov.hmrc.thirdpartyapplication.models.{ApplicationNameValidationResult, ApplicationStateChange, _}
 import uk.gov.hmrc.thirdpartyapplication.repository.{ApplicationRepository, StateHistoryRepository, SubscriptionRepository}
 import uk.gov.hmrc.thirdpartyapplication.services.AuditAction._
 import uk.gov.hmrc.thirdpartyapplication.util.CredentialGenerator
@@ -45,7 +46,7 @@ import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.Future
 import scala.concurrent.Future.{failed, sequence, successful}
 import scala.concurrent.duration.Duration
-import scala.util.Failure
+import scala.util.{Failure, Success, Try}
 
 @Singleton
 class ApplicationService @Inject()(applicationRepository: ApplicationRepository,
@@ -286,38 +287,9 @@ class ApplicationService @Inject()(applicationRepository: ApplicationRepository,
     }
   }
 
-  def requestUplift(applicationId: UUID, applicationName: String,
-                    requestedByEmailAddress: String)(implicit hc: HeaderCarrier): Future[ApplicationStateChange] = {
-
-    def uplift(existing: ApplicationData) = existing.copy(
-      name = applicationName,
-      normalisedName = applicationName.toLowerCase,
-      state = existing.state.toPendingGatekeeperApproval(requestedByEmailAddress))
-
-    for {
-      app <- fetchApp(applicationId)
-      upliftedApp = uplift(app)
-      _ <- assertAppHasUniqueNameAndAudit(applicationName, app.access.accessType, Some(app))
-      updatedApp <- applicationRepository.save(upliftedApp)
-      _ <- insertStateHistory(
-        app,
-        PENDING_GATEKEEPER_APPROVAL, Some(TESTING),
-        requestedByEmailAddress, COLLABORATOR,
-        (a: ApplicationData) => applicationRepository.save(a)
-      )
-      _ = Logger.info(s"UPLIFT01: uplift request (pending) application:${app.name} appId:${app.id} appState:${app.state.name} " +
-        s"appRequestedByEmailAddress:${app.state.requestedByEmailAddress}")
-      _ = auditService.audit(ApplicationUpliftRequested,
-        AuditHelper.applicationId(applicationId) ++ AuditHelper.calculateAppNameChange(app, updatedApp))
-    } yield UpliftRequested
-  }
-
-  // TODO: Make this not throw exceptions
-  // TODO: This doesn't check for black listed names
   private def assertAppHasUniqueNameAndAudit(submittedAppName: String, accessType: AccessType, existingApp: Option[ApplicationData] = None)
-                                            (implicit hc: HeaderCarrier) = {
+                                            (implicit hc: HeaderCarrier): Future[Either[ApplicationStateChange,Unit]] = {
     for {
-      // TODO: Call out validateName method
       unique <- doesAppHasUniqueName(submittedAppName)
       _ = if (!unique) {
         accessType match {
@@ -328,10 +300,40 @@ class ApplicationService @Inject()(applicationRepository: ApplicationRepository,
           case _ => auditService.audit(ApplicationUpliftRequestDeniedDueToNonUniqueName,
             AuditHelper.applicationId(existingApp.get.id) ++ Map("applicationName" -> submittedAppName))
         }
-        // TODO: Make not throw exceptions?
-        throw ApplicationAlreadyExists(submittedAppName)
+        Left(DuplicateApplicationName(submittedAppName))
       }
-    } yield ()
+    } yield Right(Unit)
+  }
+
+// scalastyle:off
+  def requestUplift(applicationId: UUID, applicationName: String,
+                    requestedByEmailAddress: String)(implicit hc: HeaderCarrier): EitherT[Future,ApplicationStateChange,ApplicationStateChange] = {
+    def uplift(existing: ApplicationData) = existing.copy(
+      name = applicationName,
+      normalisedName = applicationName.toLowerCase,
+      state = existing.state.toPendingGatekeeperApproval(requestedByEmailAddress))
+
+    import cats.implicits._
+    import cats._
+
+    val error : ApplicationStateChange = BadRequest
+
+    for {
+      app <- EitherT.fromOptionF(applicationRepository.fetch(applicationId), error)
+      upliftedApp = uplift(app)
+      _ <- EitherT (assertAppHasUniqueNameAndAudit(applicationName, app.access.accessType, Some(app)))
+      updatedApp <- EitherT(applicationRepository.save(upliftedApp).map(_.asRight[ApplicationStateChange]))
+      _ <- EitherT(insertStateHistory(  app,
+                                        PENDING_GATEKEEPER_APPROVAL, Some(TESTING),
+                                        requestedByEmailAddress, COLLABORATOR,
+                                        (a: ApplicationData) => applicationRepository.save(a)
+                                      ).map(_.asRight[ApplicationStateChange]))
+      _ = Logger.info(s"UPLIFT01: uplift request (pending) application:${app.name} appId:${app.id} appState:${app.state.name} " +
+              s"appRequestedByEmailAddress:${app.state.requestedByEmailAddress}")
+      _ = auditService.audit(ApplicationUpliftRequested,
+              AuditHelper.applicationId(applicationId) ++ AuditHelper.calculateAppNameChange(app, updatedApp))
+
+    } yield UpliftRequested
   }
 
   private def doesAppHasUniqueName(submittedAppName: String)
@@ -460,7 +462,7 @@ class ApplicationService @Inject()(applicationRepository: ApplicationRepository,
     } yield savedApp
   }
 
-  private def fetchApp(applicationId: UUID) = {
+  private def fetchApp(applicationId: UUID): Future[ApplicationData] = {
     val notFoundException = new NotFoundException(s"application not found for id: $applicationId")
     applicationRepository.fetch(applicationId).flatMap {
       case None => failed(notFoundException)
@@ -534,7 +536,7 @@ class ApplicationService @Inject()(applicationRepository: ApplicationRepository,
   }
 
   private def insertStateHistory(snapshotApp: ApplicationData, newState: State, oldState: Option[State],
-                                 requestedBy: String, actorType: ActorType.ActorType, rollback: ApplicationData => Any) = {
+                                 requestedBy: String, actorType: ActorType.ActorType, rollback: ApplicationData => Any): Future[StateHistory] = {
     val stateHistory = StateHistory(snapshotApp.id, newState, Actor(requestedBy, actorType), oldState)
     stateHistoryRepository.insert(stateHistory) andThen {
       case Failure(_) =>

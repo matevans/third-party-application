@@ -249,6 +249,7 @@ object State extends Enumeration {
 case class ApplicationState(name: State = TESTING, requestedByEmailAddress: Option[String] = None,
                             verificationCode: Option[String] = None, updatedOn: DateTime = DateTimeUtils.now) {
 
+  // TODO - make return Try (Either?)
   final def requireState(requirement: State, transitionTo: State): Unit = {
     if (name != requirement) {
       throw new InvalidStateTransition(expectedFrom = requirement, invalidFrom = name, to = transitionTo)
@@ -261,6 +262,7 @@ case class ApplicationState(name: State = TESTING, requestedByEmailAddress: Opti
   }
 
   def toTesting = copy(name = TESTING, requestedByEmailAddress = None, verificationCode = None, updatedOn = DateTimeUtils.now)
+
 
   def toPendingGatekeeperApproval(requestedByEmailAddress: String) = {
     requireState(requirement = TESTING, transitionTo = State.PENDING_GATEKEEPER_APPROVAL)
@@ -372,3 +374,7 @@ case object Deleted extends ApplicationStateChange
 case object Blocked extends ApplicationStateChange
 
 case object Unblocked extends ApplicationStateChange
+
+case object BadRequest extends ApplicationStateChange
+
+case class DuplicateApplicationName(name: String) extends ApplicationStateChange

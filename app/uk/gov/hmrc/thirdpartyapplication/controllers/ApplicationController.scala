@@ -183,19 +183,29 @@ class ApplicationController @Inject()(val applicationService: ApplicationService
           })
 
       } recover recovery
-  }
+    }
 
+  def requestUplift(id: java.util.UUID) = Action.async(BodyParsers.parse.json) {
+    def doStuff(upliftRequest: UpliftRequest)(implicit hc: HeaderCarrier) = {
+      import cats.implicits._
+      import cats._
 
-  def requestUplift(id: java.util.UUID) = Action.async(BodyParsers.parse.json) { implicit request =>
-    withJsonBody[UpliftRequest] { upliftRequest =>
-      applicationService.requestUplift(id, upliftRequest.applicationName, upliftRequest.requestedByEmailAddress)
-        .map(_ => NoContent)
-    } recover {
-      case _: InvalidStateTransition =>
-        PreconditionFailed(JsErrorResponse(INVALID_STATE_TRANSITION, s"Application is not in state '${State.TESTING}'"))
-      case e: ApplicationAlreadyExists =>
-        Conflict(JsErrorResponse(APPLICATION_ALREADY_EXISTS, s"Application already exists with name: ${e.applicationName}"))
-    } recover recovery
+      applicationService
+        .requestUplift(id, upliftRequest.applicationName, upliftRequest.requestedByEmailAddress)
+        .fold({
+          case BadRequest => PreconditionFailed(
+            JsErrorResponse(INVALID_STATE_TRANSITION, s"Application is not in state '${State.TESTING}'"))
+
+          case DuplicateApplicationName(name) =>
+            Conflict(JsErrorResponse(APPLICATION_ALREADY_EXISTS, s"Application already exists with name: $name"))
+        }, _ => NoContent)
+    }
+
+    implicit request => withJsonBody[UpliftRequest] { upliftRequest =>
+        doStuff(upliftRequest) recover {
+          case _ => InternalServerError(JsErrorResponse(UNKNOWN_ERROR, "An unexpected error occurred"))
+        }
+    }
   }
 
   private def handleOption[T](future: Future[Option[T]])(implicit writes: Writes[T]): Future[Result] = {
